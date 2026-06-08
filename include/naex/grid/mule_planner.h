@@ -40,7 +40,7 @@ class MulePlanner {
                   std::bind(&MulePlanner::pathCb, this, std::placeholders::_1));
 
       path_pub_ = nh_->create_publisher<nav_msgs::msg::Path>("~/path", 2);
-      map_pub_ = nh_->create_publisher<sensor_msgs::msg::PointCloud2>("planner_grid", 2);
+      map_pub_ = nh_->create_publisher<sensor_msgs::msg::PointCloud2>("~/planner_grid", 2);
     }
     // --------------------------------------------------------
     // --------------------------------------------------------

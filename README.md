@@ -1,110 +1,37 @@
 # Naex
 
-A package for robot navigation and exploration.
-It is a work-in-progress, so this description is incomplete and may be slightly out of date.
+A package for planning in a traversability grid using AStar. Fork for Taros Mule @ ELROB 2026.
 
-## Planner
+## Taros Mule Planner
 
-The `planner` node internally builds a point map from input points clouds to assess traversability and plan paths globally.
-It provides `get_plan` service to handle planning requests.
-The `start`pose may be NaN, while the `goal` pose is required (no exploration mode).
+#### Planner loop
 
-If `start` is not provided, the plan starts with the current robot position.
-Start `tolerance` in meters may be specified, which limits the distance from the requested starting position and the selected traversable starting point within the map.
-
-If valid goal is provided, a path is planned between some start and goal vertices. Those are chosen like this (vs(vg) is start(goal) point converted to vertex in grid coords):
-
-IF vs is explored:
-  IF vs is traversable:
-    keep vs
-  ELSE:
-    IF nearest traversable vertex to vs is close:
-      use that instead of vs
-    ELSE:
-      fail
-ELSE:
-  IF nearest traversable vertex to vs is close:
-    use that instead of vs
-  ELSE:
-    return a straight line to goal as a plan
-
-If vg is explored:
-
-
-The node assumes an external localization is provided.
-The last request is (by default) periodically repeated and updated plan is published.
+The planner loop goes off on each received traversability point cloud:
+  1. The planner grid/graph is built.
+  2. If latest received path is obstacle free, it is republished and the loop ends.
+  3. Else, we will be replanning:
+    a. The start node of the graph is selected (has to be traversable and has to be close to the robot, if this cannot be satisfied, return).
+    b. Run AStar on the graph (no early stopping).
+    c. Choose goal of the path as the last reachable point (i.e. AStar could get there) on the original path (e.g. if there is an obstacle in the middle of the path and we can see behind it (tree, red&white tape), then choose the point behind it, if the obstacles is huge, like a building, then we will likely only select the last point on the path before the building).
+    d. Based on the AStar results get the optimal path from start to goal.
+    e. If the tail of the path (the part of the original path from the planner goal to its original goal) is traverable, append it to the planned path. Else don't.
+    f. Publish path.
 
 #### Subscribed topics
 
-- `input_cloud_0` [[sensor_msgs/PointCloud2](http://docs.ros.org/en/noetic/api/sensor_msgs/html/msg/PointCloud2.html)]  
-  Input point cloud from sensor 0 (remap to the actual sensor topic).
-- `input_cloud_1` [sensor_msgs/PointCloud2]
-- ...
-- `input_map` [sensor_msgs/PointCloud2]
+- `points` -> `/terrain_map` (sensor_msgs/PointCloud2)
+  Single scan traversability map in the form of a square grid point cloud with 'traversability' score for each point. The planner builds a graph out of this to run AStar on.
+- `path` -> `/path` (nav_msgs/Path)
+  The proposed odometry path. As long as it is traversable this node only republishes it. Once there is an obstacle on the path, the planner plans an alternative traversable path based on the original one.
 
 #### Published Topics
 
-- `viewpoints` [sensor_msgs/PointCloud2]  
-  Robot viewpoints considered in rewards.
-- `other_viewpoints` [sensor_msgs/PointCloud2]  
-  Viewpoints of other robots considered in rewards.
-- `map` [sensor_msgs/PointCloud2]  
-  Complete map used for planning, see bit field `flags` for labels.
-- `updated_map` [sensor_msgs/PointCloud2]  
-  Only added or removed map points (map deltas).
-- `local_map` [sensor_msgs/PointCloud2]  
-  Local map around the robot.
-- `path` [[nav_msgs/Path](http://docs.ros.org/en/noetic/api/nav_msgs/html/msg/Path.html)]  
-  Planned path.
+- `~/planner_grid` -> `/mule_planner/planner_grid` (sensor_msgs/PointCloud2)  
+  The graph created out of the single scan traversability that we plan in. Should basically mirror the subscribed `points` and is here just for debug.
+- `~/path` -> `/mule_planner/path` (nav_msgs/Path)
+  Planned path. Either original if traversable or in the opposite case a traversable alternative. 
 
-        enum Flags
-        {
-            // Point was updated including its neighborhood. Otherwise it's queued for
-            // updated.
-            UPDATED     = 1 << 0,
-            // A static point, not dynamic or empty, necessary for being traversable.
-            STATIC      = 1 << 1,
-            // Approximately horizontal orientation based on normal direction,
-            // necessary condition for being traversable.
-            HORIZONTAL  = 1 << 2,
-            // Near another actor.
-            ACTOR       = 1 << 3,
-            // A point at the edge, i.e. a frontier.
-            EDGE        = 1 << 4,
-            // Traversable based on terrain roughness and obstacles in neighborhood.
-            TRAVERSABLE = 1 << 5
-        };
-
-#### Services
-
-- `get_plan` [nav_msgs/GetPlan]
-
-### follower
-
-The `follower` node follows published paths.
-At each control step the closest point on the path, with an optional look-ahead distance, is selected as navigation goal.
-New path is selected if the previous one has been completed or the current one has already been followed for a given time.
-It stops to avoid collisions, which are assessed from input point clouds.
-It can backtrack if no valid path is received for some time.
 
 ## Usage
 
-Launchers are available, currently for SubT virtual experiments.
-See the launch files for available parameters.
-
-Launch planner (assumes localization within `subt` frame is available):
-
-    roslaunch naex planner.launch
-
-Launch follower (assumes localization within `subt` frame is available):
-
-    roslaunch naex follower.launch
-
-Launch the above with preprocessing, SLAM, recording etc.:
-
-    roslaunch naex naex.launch
-
-Play recorded bag files from SubT virtual robots X1, X2, X3 located inside the current working directory (topics in `/robot_data` namespace):
-
-    bags=$(ls $(pwd)/*bag) roslaunch naex playback.launch rate:=10
-
+Launch: `ros2 launch mule_planner.launch.py`
