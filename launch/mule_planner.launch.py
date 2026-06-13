@@ -33,8 +33,8 @@ def generate_launch_description():
                         
                         "robot_frame": "base_link",
                         "position_field": "x",
-                        "max_cloud_age": 9999999999.0,
-                        "max_ts_diff": 9999999999.0,
+                        "max_cloud_age": 1.0,
+                        "max_ts_diff": 1.0,
                         "cell_size": 0.6,
                         "forget_factor": 1.0,
                         "cost_field": "traversability",
@@ -42,6 +42,9 @@ def generate_launch_description():
                         "neighborhood": 8,
                         "obstacle_cost_threshold": 0.7,
                         "path_sampling_dist": 0.1, # meters between path waypoints (0 = disabled)
+                        # if true, skip publishing when the path output on the previous
+                        # iteration is still obstacle-free (uses ekf_odom to track motion)
+                        "check_previous_path": True,
                         "use_sim_time": LaunchConfiguration("use_sim_time")
                     }
                 ],
@@ -49,6 +52,7 @@ def generate_launch_description():
                     #("input_cloud_0", "osm_grid"),
                     ("path", "/path"),
                     ("points", "/terrain_map"),
+                    ("ekf_odom", "/taros/ekf_odom"),
                 ],
             )
         ]

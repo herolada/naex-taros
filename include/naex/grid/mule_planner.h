@@ -1,9 +1,12 @@
 #pragma once
 #include <geometry_msgs/msg/point.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <tf2/LinearMath/Transform.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include "naex/types.h"
 #include "naex/grid/grid.h"
 #include "naex/grid/search.h"
@@ -27,6 +30,8 @@ class MulePlanner {
 
       neighborhood_ = nh_->declare_parameter<int>("neighborhood", neighborhood_);
 
+      check_previous_path_ = nh_->declare_parameter<bool>("check_previous_path", check_previous_path_);
+
       path_sampling_dist_ = nh_->declare_parameter<float>("path_sampling_dist", path_sampling_dist_);
       cell_size_ = nh_->declare_parameter<float>("cell_size", 1.0f);
       float forget_factor = nh_->declare_parameter<float>("forget_factor", 1.0f);
@@ -38,8 +43,11 @@ class MulePlanner {
                   std::bind(&MulePlanner::cloudCb, this, std::placeholders::_1));
       path_sub_ = nh_->create_subscription<nav_msgs::msg::Path>("path", rclcpp::SystemDefaultsQoS(),
                   std::bind(&MulePlanner::pathCb, this, std::placeholders::_1));
+      odom_sub_ = nh_->create_subscription<nav_msgs::msg::Odometry>("ekf_odom", rclcpp::SystemDefaultsQoS(),
+                  std::bind(&MulePlanner::odomCb, this, std::placeholders::_1));
 
       path_pub_ = nh_->create_publisher<nav_msgs::msg::Path>("~/path", 2);
+      previous_path_pub_ = nh_->create_publisher<nav_msgs::msg::Path>("~/previous_path", 2);
       map_pub_ = nh_->create_publisher<sensor_msgs::msg::PointCloud2>("~/planner_grid", 2);
     }
     // --------------------------------------------------------
@@ -95,11 +103,46 @@ class MulePlanner {
       if (isPathObstacleFree(current_path)) {
         auto republished_path = resamplePath(current_path);
         republished_path.header.stamp = nh_->get_clock()->now();
-        path_pub_->publish(republished_path);
+        publishReplannedPath(republished_path);
         RCLCPP_INFO(nh_->get_logger(),
                     "Original path is obstacle-free, republishing %lu poses (%.3f s).",
                     republished_path.poses.size(), t.seconds_elapsed());
         return;
+      }
+
+      // The original path is not obstacle-free, but the path we already output on
+      // the previous iteration may still be. If so, keep following it instead of
+      // replanning/republishing. The previous output is expressed in the robot
+      // frame as it was then, so transform it into the current robot frame using
+      // the odometry travelled since.
+      if (check_previous_path_) {
+        nav_msgs::msg::Path previous_path;
+        nav_msgs::msg::Odometry previous_odom;
+        nav_msgs::msg::Odometry current_odom;
+        bool can_check = false;
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          if (has_odom_ && has_previous_replanned_path_ &&
+              !previous_replanned_path_.poses.empty()) {
+            previous_path = previous_replanned_path_;
+            previous_odom = previous_replanned_odom_;
+            current_odom = odom_;
+            can_check = true;
+          }
+        }
+        if (can_check) {
+          auto previous_path_now =
+              transformPathByOdom(previous_path, previous_odom, current_odom);
+          previous_path_now.header.stamp = nh_->get_clock()->now();
+          previous_path_pub_->publish(previous_path_now);
+          if (isPathObstacleFree(previous_path_now)) {
+            RCLCPP_INFO(
+                nh_->get_logger(),
+                "Previously replanned path is still obstacle-free, not republishing (%.3f s).",
+                t.seconds_elapsed());
+            return;
+          }
+        }
       }
 
       // Get start vertex.
@@ -217,7 +260,7 @@ class MulePlanner {
 
       if (isPathObstacleFree(current_path, goal_path_index + 1)) {
         appendPathSuffix(current_path, goal_path_index + 1, local_plan);
-        path_pub_->publish(resamplePath(local_plan));
+        publishReplannedPath(resamplePath(local_plan));
         RCLCPP_INFO(nh_->get_logger(),
                     "Published replanned prefix with original suffix, %lu poses total (%.3f s).",
                     local_plan.poses.size(), t.seconds_elapsed());
@@ -226,7 +269,7 @@ class MulePlanner {
 
       const auto traversable_path_length = pathLength(local_plan);
       if (traversable_path_length >= min_traversable_path_length_) {
-        path_pub_->publish(resamplePath(local_plan));
+        publishReplannedPath(resamplePath(local_plan));
         RCLCPP_INFO(nh_->get_logger(),
                     "Published traversable prefix only, length %.3f m with %lu poses (%.3f s).",
                     traversable_path_length, local_plan.poses.size(), t.seconds_elapsed());
@@ -250,7 +293,54 @@ class MulePlanner {
       std::lock_guard<std::mutex> lock(mutex_);
       path_ = *input;
     }
-    
+
+    void odomCb(
+        const std::shared_ptr<const nav_msgs::msg::Odometry> &input
+      ) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      odom_ = *input;
+      has_odom_ = true;
+    }
+
+    // Publish a planner output path and remember it (together with the current
+    // odometry) so the next iteration can check whether it is still valid.
+    void publishReplannedPath(const nav_msgs::msg::Path &path) {
+      path_pub_->publish(path);
+      if (!check_previous_path_) {
+        return;
+      }
+      std::lock_guard<std::mutex> lock(mutex_);
+      previous_replanned_path_ = path;
+      previous_replanned_odom_ = odom_;
+      has_previous_replanned_path_ = has_odom_;
+    }
+
+    // Re-express a path known in the robot frame at from_odom into the robot
+    // frame at to_odom, using the relative motion reported by the odometry.
+    nav_msgs::msg::Path transformPathByOdom(
+        const nav_msgs::msg::Path &path,
+        const nav_msgs::msg::Odometry &from_odom,
+        const nav_msgs::msg::Odometry &to_odom) const {
+      tf2::Transform t_odom_from;
+      tf2::Transform t_odom_to;
+      tf2::fromMsg(from_odom.pose.pose, t_odom_from);
+      tf2::fromMsg(to_odom.pose.pose, t_odom_to);
+      const tf2::Transform t_to_from = t_odom_to.inverse() * t_odom_from;
+      nav_msgs::msg::Path out;
+      out.header = path.header;
+      out.poses.reserve(path.poses.size());
+      for (auto pose : path.poses) {
+        tf2::Vector3 p(pose.pose.position.x, pose.pose.position.y,
+                       pose.pose.position.z);
+        p = t_to_from * p;
+        pose.pose.position.x = p.x();
+        pose.pose.position.y = p.y();
+        pose.pose.position.z = p.z();
+        out.poses.push_back(pose);
+      }
+      return out;
+    }
+
     void fillMapCloud(sensor_msgs::msg::PointCloud2 &cloud, const Grid &grid,
                     const std::vector<Cost> &path_costs, const std::vector<Cost> &f_values) {
       // TODO: Allow sending local map.
@@ -433,8 +523,10 @@ class MulePlanner {
 
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pcl_sub_;
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
-    
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr previous_path_pub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
 
     // Params
@@ -452,9 +544,19 @@ class MulePlanner {
     float path_sampling_dist_{0.f};  // 0 = disabled; >0 = resample path at this spacing (m)
     float cell_size_{1.0};
     Costs default_costs_;
+    bool check_previous_path_{false};
 
     nav_msgs::msg::Path path_;
     Grid grid_{};
+
+    // Latest odometry, used to track how far the robot moved between iterations.
+    nav_msgs::msg::Odometry odom_;
+    bool has_odom_{false};
+
+    // Path published on the previous iteration and the odometry at that time.
+    nav_msgs::msg::Path previous_replanned_path_;
+    nav_msgs::msg::Odometry previous_replanned_odom_;
+    bool has_previous_replanned_path_{false};
 
     std::mutex mutex_;
 };
