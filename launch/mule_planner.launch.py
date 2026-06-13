@@ -45,12 +45,21 @@ def generate_launch_description():
                         # if true, skip publishing when the path output on the previous
                         # iteration is still obstacle-free (uses ekf_odom to track motion)
                         "check_previous_path": True,
+                        # once committed to a replanned detour, keep following it
+                        # (ignoring whether the original path became traversable
+                        # again) until the robot is within this distance of the
+                        # detour's final/meeting point
+                        "min_dist_to_meeting_point": 2.0,
+                        # the meeting point is placed this far past the rejoin
+                        # vertex along the original suffix (detour -> rejoin ->
+                        # tail -> meeting point)
+                        "meeting_point_tail_length": 4.0,
                         "use_sim_time": LaunchConfiguration("use_sim_time")
                     }
                 ],
                 remappings=[
                     #("input_cloud_0", "osm_grid"),
-                    ("path", "/path"),
+                    ("path", "/pfvtr/repeat/local_trajectory_corrected"), # /pfvtr/repeat/local_trajectory_corrected
                     ("points", "/terrain_map"),
                     ("ekf_odom", "/taros/ekf_odom"),
                 ],
